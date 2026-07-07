@@ -3,3 +3,4 @@ plotly
 dash
 dash-bootstrap-components
 rapidfuzz
+gunicorn

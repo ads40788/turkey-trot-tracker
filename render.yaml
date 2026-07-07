@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: turkey-trot-tracker
+    env: python
+    plan: free
+    buildCommand: "bash build.sh"
+    startCommand: "gunicorn app:server"
+    envVars:
+      - key: DATA_REPO_TOKEN
+        sync: false
