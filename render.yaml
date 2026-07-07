@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: "bash build.sh"
-    startCommand: "gunicorn app:server"
+    startCommand: "gunicorn app:server --workers=1 --threads=4 --timeout=120"
     envVars:
       - key: DATA_REPO_TOKEN
         sync: false
