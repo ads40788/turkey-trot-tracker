@@ -590,14 +590,19 @@ lookup_tab = dbc.Container([
             ),
         ], md=6),
     ]),
-    # Share bar, hidden until a runner is selected
+    # Share bar: shares the selected runner(s), or the site itself if none.
     html.Div([
+        # Handled by assets/share.js (a native click listener), because the
+        # share sheet must open inside the real tap gesture.
+        html.Button("📲 Share to Instagram Story", id="ig-story-btn", n_clicks=0,
+                    className="btn btn-sm me-2",
+                    style={"background": "linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888)",
+                           "border": "none", "color": "white", "fontWeight": 600}),
         dbc.Button("🔗 Share link", id="share-btn", color="warning", size="sm",
                    n_clicks=0, className="me-2"),
         dbc.DropdownMenu(
             label="⬇ Download image",
             color="secondary", size="sm", className="d-inline-block",
-            toggle_class_name="btn-outline-secondary",
             children=[
                 # The server sends these as attachments, so a plain link downloads.
                 dbc.DropdownMenuItem("Link preview / Facebook (1200×630)",
@@ -609,7 +614,8 @@ lookup_tab = dbc.Container([
             ],
         ),
         html.Span(id="share-status", className="ms-2 small text-success"),
-    ], id="share-bar", className="mb-3", style={"display": "none"}),
+        html.Div(id="ig-status", className="small text-muted mt-1"),
+    ], id="share-bar", className="mb-3"),
     html.Div(id="runner-output"),
     # Link section — always in DOM, hidden until a runner is selected
     html.Div([
@@ -1477,23 +1483,23 @@ def load_shared_link(search):
     Input("runner-search-2", "value"),
 )
 def update_share_bar(k1, k2):
-    if not (k1 or k2):
-        return {"display": "none"}, "", "", ""
+    # With no runner selected, the buttons share the site's general card.
     k1, k2 = (k1, k2) if k1 else (k2, None)
     q = share_query(k1, k2)
-    return ({}, *(f"/preview.png?{q}&size={s}&download=1"
-                  for s in ("landscape", "portrait", "story")))
+    prefix = f"/preview.png?{q}&" if q else "/preview.png?"
+    return ({}, *(f"{prefix}size={s}&download=1" for s in ("landscape", "portrait", "story")))
 
 
 app.clientside_callback(
     """
     async function(n, k1, k2) {
-        if (!n || !(k1 || k2)) { return window.dash_clientside.no_update; }
+        if (!n) { return window.dash_clientside.no_update; }
         if (!k1) { k1 = k2; k2 = null; }
         const p = new URLSearchParams();
-        p.set("runner", k1);
+        if (k1) { p.set("runner", k1); }
         if (k2 && k2 !== k1) { p.set("vs", k2); }
-        const url = location.origin + location.pathname + "?" + p.toString();
+        const q = p.toString();
+        const url = location.origin + location.pathname + (q ? "?" + q : "");
         const isMobile = /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
         if (isMobile && navigator.share) {
             try { await navigator.share({title: "Buffalo Turkey Trot results", url: url}); }
