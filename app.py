@@ -4,8 +4,11 @@ Buffalo Turkey Trot Results Dashboard
 
 import re
 import sqlite3
+from contextlib import closing
+from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -19,13 +22,30 @@ DB_PATH = Path(__file__).parent / "db" / "turkey_trot.db"
 # Data helpers
 # ---------------------------------------------------------------------------
 
+# numpy scalars (e.g. values pulled out of a DataFrame) are otherwise bound as
+# BLOBs by sqlite3, so `WHERE year = ?` silently matches nothing.
+sqlite3.register_adapter(np.int64, int)
+sqlite3.register_adapter(np.int32, int)
+sqlite3.register_adapter(np.float64, float)
+
+
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
 
 def query(sql: str, params=()) -> pd.DataFrame:
-    with get_conn() as conn:
+    # `with sqlite3.connect()` only manages transactions; closing() releases it.
+    with closing(get_conn()) as conn:
         return pd.read_sql(sql, conn, params=params)
+
+
+def fmt_time(secs):
+    if pd.isna(secs):
+        return "—"
+    s = int(secs)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
 def normalize_name(name: str) -> str:
@@ -61,14 +81,18 @@ def search_names(search: str, limit: int = 50) -> list[dict]:
     return df.to_dict("records")
 
 
+def _normalize_time_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """Source data mixes '0:24:39' and '24:01'; rebuild display strings from seconds."""
+    for col in ("gun_time", "net_time"):
+        sec = df[f"{col}_sec"]
+        df[col] = [fmt_time(s) if pd.notna(s) else (t or "—")
+                   for s, t in zip(sec, df[col])]
+    return df
+
+
 def runner_history(name_key: str) -> pd.DataFrame:
     """Fetch all results matching this normalized key (covers all name variants)."""
-    return query(
-        "SELECT year, name, overall_place, sex_place, age_group, ag_rank_of_total, "
-        "gun_time, gun_time_sec, net_time, net_time_sec, city, state, age "
-        "FROM results WHERE name_key = ? ORDER BY year",
-        (name_key,),
-    )
+    return runner_history_multi({name_key})
 
 
 def runner_history_multi(keys: set[str]) -> pd.DataFrame:
@@ -76,12 +100,13 @@ def runner_history_multi(keys: set[str]) -> pd.DataFrame:
     if not keys:
         return pd.DataFrame()
     ph = ",".join("?" * len(keys))
-    return query(
+    df = query(
         f"SELECT year, name, overall_place, sex_place, age_group, ag_rank_of_total, "
         f"gun_time, gun_time_sec, net_time, net_time_sec, city, state, age "
         f"FROM results WHERE name_key IN ({ph}) ORDER BY year",
         tuple(sorted(keys)),
     )
+    return _normalize_time_strings(df)
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +349,7 @@ def person_label(name: str, df: pd.DataFrame) -> str:
     return name
 
 
+@lru_cache(maxsize=1)
 def year_summary() -> pd.DataFrame:
     return query("""
         SELECT
@@ -395,24 +421,41 @@ def companions_for_runner(
     return result
 
 
+@lru_cache(maxsize=1)
+def names_by_year() -> dict[int, frozenset[str]]:
+    df = query("SELECT year, LOWER(TRIM(name)) AS name FROM results")
+    return {int(yr): frozenset(g["name"]) for yr, g in df.groupby("year")}
+
+
+@lru_cache(maxsize=1)
 def retention_matrix() -> pd.DataFrame:
     """For each pair of years, count runners appearing in both."""
-    years_df = query("SELECT DISTINCT year FROM results ORDER BY year")
-    years = years_df["year"].tolist()
-    names_by_year = {}
-    for yr in years:
-        df = query("SELECT LOWER(TRIM(name)) AS name FROM results WHERE year=?", (yr,))
-        names_by_year[yr] = set(df["name"])
-
+    nby = names_by_year()
+    years = sorted(nby)
     records = []
     for yr_a in years:
         for yr_b in years:
             if yr_a <= yr_b:
-                overlap = len(names_by_year[yr_a] & names_by_year[yr_b])
+                overlap = len(nby[yr_a] & nby[yr_b])
                 records.append({"year_a": yr_a, "year_b": yr_b, "shared": overlap})
                 if yr_a != yr_b:
                     records.append({"year_a": yr_b, "year_b": yr_a, "shared": overlap})
     return pd.DataFrame(records)
+
+
+@lru_cache(maxsize=1)
+def streak_distribution() -> pd.DataFrame:
+    """How many runners have a longest consecutive-year streak of N?"""
+    nby = names_by_year()
+    years = sorted(nby)
+    streak_counts: dict[int, int] = {}
+    for n in set().union(*nby.values()):
+        best = cur = 0
+        for yr in years:
+            cur = cur + 1 if n in nby[yr] else 0
+            best = max(best, cur)
+        streak_counts[best] = streak_counts.get(best, 0) + 1
+    return pd.DataFrame(sorted(streak_counts.items()), columns=["streak", "runners"])
 
 
 # ---------------------------------------------------------------------------
@@ -426,20 +469,38 @@ app = dash.Dash(
 )
 server = app.server  # for deployment
 
+def _backfill_name_keys() -> None:
+    """Rows added after the name_key migration (e.g. 2020) have NULL keys and
+    never show up in runner search. Fill them in using the same normalization."""
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT id, name FROM results WHERE name_key IS NULL AND name IS NOT NULL"
+        ).fetchall()
+        if rows:
+            conn.executemany(
+                "UPDATE results SET name_key = ? WHERE id = ?",
+                [(normalize_name(name), rid) for rid, name in rows],
+            )
+            conn.commit()
+
+
+_backfill_name_keys()
+
 YEARS = query("SELECT DISTINCT year FROM results ORDER BY year")["year"].tolist()
+
+# Corral analysis needs chip timing (gun time differs from net time). Early
+# years were gun-timed only, and 2006/2020 have no gun times at all.
+CHIP_YEARS = query("""
+    SELECT year FROM results
+    GROUP BY year
+    HAVING SUM(gun_time_sec IS NOT NULL AND net_time_sec IS NOT NULL
+               AND gun_time_sec != net_time_sec) > 0
+    ORDER BY year
+""")["year"].tolist()
 
 # ---------------------------------------------------------------------------
 # Layout helpers
 # ---------------------------------------------------------------------------
-
-def fmt_time(secs):
-    if pd.isna(secs):
-        return "—"
-    s = int(secs)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
-
 
 HEADER = dbc.Navbar(
     dbc.Container(
@@ -582,9 +643,11 @@ year_tab = dbc.Container([
         ], md=2),
     ], className="mb-2"),
     dbc.Row([
-        dbc.Col(dcc.Graph(id="year-dist"), md=9),
-        dbc.Col(html.Div(id="year-dist-stats"), md=3),
+        dbc.Col(dcc.Graph(id="year-dist"), md=12),
     ]),
+    dbc.Row([
+        dbc.Col(html.Div(id="year-dist-stats"), lg=8, xl=6),
+    ], className="mb-3"),
 ], fluid=True)
 
 
@@ -592,12 +655,17 @@ corral_tab = dbc.Container([
     dbc.Row([
         dbc.Col([
             html.Label("Year", className="fw-semibold"),
+            html.Small(
+                " (chip-timed years only: earlier races recorded gun time alone)",
+                className="text-muted",
+            ),
             dcc.Slider(
                 id="corral-year-slider",
-                min=YEARS[0], max=YEARS[-1],
+                min=CHIP_YEARS[0], max=CHIP_YEARS[-1],
                 step=None,
-                marks={y: str(y) for y in YEARS},
-                value=YEARS[-1],
+                marks={y: f"'{y % 100:02d}" for y in CHIP_YEARS},
+                value=CHIP_YEARS[-1],
+                tooltip={"placement": "bottom", "always_visible": False},
                 className="mb-2",
             ),
         ]),
@@ -1063,13 +1131,26 @@ def do_remove_link(n_clicks_list, store):
 # Year Overview callbacks
 # ---------------------------------------------------------------------------
 
+def _require_tab(active: str | None, wanted: str) -> None:
+    """Only draw a tab's charts while it is visible.
+
+    Plotly measures its container when a figure is drawn; inside a hidden
+    (display:none) tab that width is wrong, so charts come out clipped or
+    squashed. Drawing on tab activation also stops hidden tabs from
+    recomputing every time the user switches tabs.
+    """
+    if active != wanted:
+        raise dash.exceptions.PreventUpdate
+
+
 @app.callback(
     Output("year-finishers", "figure"),
     Output("year-avg-time", "figure"),
     Output("year-gender-split", "figure"),
     Input("main-tabs", "active_tab"),
 )
-def update_year_tab(tab):
+def update_year_tab(tab="tab-year"):
+    _require_tab(tab, "tab-year")
     df = year_summary()
 
     fig_fin = px.bar(df, x="year", y="finishers",
@@ -1140,8 +1221,10 @@ def _filter_age_bracket(df: pd.DataFrame, bracket: str) -> pd.DataFrame:
     Input("dist-sex-filter", "value"),
     Input("dist-age-bracket", "value"),
     Input("dist-norm", "value"),
+    Input("main-tabs", "active_tab"),
 )
-def update_dist(year_a, year_b, sex_filter, age_bracket, histnorm):
+def update_dist(year_a, year_b, sex_filter, age_bracket, histnorm, tab="tab-year"):
+    _require_tab(tab, "tab-year")
     raw = two_year_dist_data(year_a, year_b)
 
     def _prep(yr):
@@ -1162,41 +1245,37 @@ def update_dist(year_a, year_b, sex_filter, age_bracket, histnorm):
 
     # Shared bin edges across both datasets so bars align and widths match
     all_mins = pd.concat([dfa["net_min"], dfb["net_min"]]).dropna()
-    bin_size = 0.5  # minutes per bin
+    bin_size = 1.0  # minutes per bin
     bin_start = (all_mins.min() // bin_size) * bin_size if not all_mins.empty else 0
     bin_end   = (all_mins.max() // bin_size + 1) * bin_size if not all_mins.empty else 120
     shared_xbins = dict(start=bin_start, end=bin_end, size=bin_size)
 
+    yaxis_label = "% of finishers" if histnorm == "percent" else "Count"
+    sex_label = {"M": "Men", "F": "Women", "Both": "All runners"}[sex_filter]
+
+    # Same year picked twice → draw it once.
+    series = [(dfa, year_a, COLOR_A)] + ([] if same_year else [(dfb, year_b, COLOR_B)])
+
     fig = go.Figure()
-    for df_i, yr, color in [(dfa, year_a, COLOR_A), (dfb, year_b, COLOR_B)]:
+    for df_i, yr, color in series:
         if df_i.empty:
             continue
+        med = df_i["net_min"].median()
         fig.add_trace(go.Histogram(
             x=df_i["net_min"],
-            name=str(yr),
+            name=f"{yr} (median {med:.1f} min)",
             histnorm=histnorm,
             xbins=shared_xbins,
             marker_color=color,
             opacity=0.55 if not same_year else 0.75,
         ))
+        # Median line; the value lives in the legend so labels never collide.
+        fig.add_vline(x=med, line_dash="dash", line_color=color, line_width=1.5)
 
-    # Median lines
-    yaxis_label = "% of finishers" if histnorm == "percent" else "Count"
-    sex_label = {"M": "Men", "F": "Women", "Both": "All runners"}[sex_filter]
-
-    for df_i, yr, color, side in [
-        (dfa, year_a, COLOR_A, "top right"),
-        (dfb, year_b, COLOR_B, "top left"),
-    ]:
-        if df_i.empty:
-            continue
-        med = df_i["net_min"].median()
-        fig.add_vline(
-            x=med, line_dash="dash", line_color=color, line_width=1.5,
-            annotation_text=f"{yr} med {med:.1f}m",
-            annotation_font_color=color,
-            annotation_position=side,
-        )
+    if not fig.data:
+        fig.add_annotation(text="No finishers match these filters.",
+                           showarrow=False, xref="paper", yref="paper",
+                           x=0.5, y=0.5, font=dict(size=14, color="#888"))
 
     title_years = str(year_a) if same_year else f"{year_a} vs {year_b}"
     age_label = "" if age_bracket == "All" else f" · {age_bracket}"
@@ -1208,7 +1287,7 @@ def update_dist(year_a, year_b, sex_filter, age_bracket, histnorm):
         plot_bgcolor="white",
         paper_bgcolor="white",
         height=400,
-        legend=dict(x=0.78, y=0.95, bgcolor="rgba(255,255,255,0.8)"),
+        legend=dict(x=0.99, y=0.97, xanchor="right", bgcolor="rgba(255,255,255,0.8)"),
         margin=dict(t=50, b=40, l=55, r=20),
     )
 
@@ -1227,7 +1306,7 @@ def update_dist(year_a, year_b, sex_filter, age_bracket, histnorm):
             "P90": f"{v.quantile(0.90):.1f}",
         }
 
-    stat_rows = [s for s in [_stats(dfa, year_a), _stats(dfb, year_b)] if s]
+    stat_rows = [s for s in (_stats(d, y) for d, y, _ in series) if s]
 
     stats_block = html.Div([
         html.P(f"{sex_label}", className="fw-semibold text-muted small mb-2"),
@@ -1243,7 +1322,7 @@ def update_dist(year_a, year_b, sex_filter, age_bracket, histnorm):
                 {"if": {"row_index": 1}, "color": COLOR_B, "fontWeight": "bold"},
             ],
         ),
-    ], className="mt-4")
+    ], className="mt-2")
 
     return fig, stats_block
 
@@ -1257,10 +1336,22 @@ def update_dist(year_a, year_b, sex_filter, age_bracket, histnorm):
     Output("corral-stats", "children"),
     Output("corral-by-ag", "figure"),
     Input("corral-year-slider", "value"),
+    Input("main-tabs", "active_tab"),
 )
-def update_corral(year):
+def update_corral(year, tab="tab-corral"):
+    _require_tab(tab, "tab-corral")
     df = year_data(year)
     df = df.dropna(subset=["gun_time_sec", "net_time_sec"])
+    if df.empty or (df["gun_time_sec"] == df["net_time_sec"]).all():
+        empty = go.Figure()
+        empty.add_annotation(text=f"No chip-timing data for {year}.", showarrow=False,
+                             xref="paper", yref="paper", x=0.5, y=0.5,
+                             font=dict(size=14, color="#888"))
+        empty.update_layout(plot_bgcolor="white", paper_bgcolor="white", height=300,
+                            xaxis_visible=False, yaxis_visible=False)
+        msg = dbc.Alert(f"{year} only recorded gun times, so wave gaps can't be computed.",
+                        color="secondary")
+        return empty, msg, empty
     df["wave_gap_sec"] = df["gun_time_sec"] - df["net_time_sec"]
     df["net_min"] = df["net_time_sec"] / 60
     df["wave_gap_min"] = df["wave_gap_sec"] / 60
@@ -1324,14 +1415,19 @@ def update_corral(year):
     Output("retention-streak", "figure"),
     Input("main-tabs", "active_tab"),
 )
-def update_retention(tab):
+def update_retention(tab="tab-retention"):
+    _require_tab(tab, "tab-retention")
     ret = retention_matrix()
 
-    # Pivot for heatmap
-    pivot = ret.pivot(index="year_a", columns="year_b", values="shared")
+    # Pivot for heatmap. The diagonal (a year vs itself = its whole field) is
+    # an order of magnitude bigger than any overlap and washes out the color
+    # scale, so blank it out.
+    pivot = ret.pivot(index="year_a", columns="year_b", values="shared").astype(float)
+    for yr in pivot.index:
+        pivot.loc[yr, yr] = np.nan
     fig_heat = px.imshow(
         pivot,
-        title="Runner overlap between years (shared finishers)",
+        title="Runner overlap between years (shared finishers, diagonal hidden)",
         labels={"color": "Shared runners"},
         color_continuous_scale="YlOrRd",
         aspect="auto",
@@ -1356,31 +1452,13 @@ def update_retention(tab):
     fig_yoy.update_layout(plot_bgcolor="white", paper_bgcolor="white",
                           height=300, xaxis_tickangle=-45)
 
-    # Streak analysis — how many runners appeared in N consecutive years?
-    names_by_year = {}
-    for yr in years:
-        df_yr = query("SELECT LOWER(TRIM(name)) AS name FROM results WHERE year=?", (yr,))
-        names_by_year[yr] = set(df_yr["name"])
-
-    all_runner_names = set().union(*names_by_year.values())
-    streak_counts: dict[int, int] = {}
-    for n in all_runner_names:
-        appeared = [1 if n in names_by_year[yr] else 0 for yr in years]
-        # longest consecutive run
-        best = cur = 0
-        for v in appeared:
-            cur = cur + 1 if v else 0
-            best = max(best, cur)
-        streak_counts[best] = streak_counts.get(best, 0) + 1
-
-    streak_df = pd.DataFrame(
-        sorted(streak_counts.items()), columns=["streak", "runners"]
-    )
+    streak_df = streak_distribution()
     fig_streak = px.bar(
         streak_df, x="streak", y="runners",
         title="Longest consecutive-year streak per runner",
-        labels={"streak": "Years in a row", "runners": "Number of runners"},
+        labels={"streak": "Years in a row", "runners": "Number of runners (log scale)"},
         color_discrete_sequence=["#1a6eb5"],
+        log_y=True,  # one-timers outnumber long streaks ~1000:1
     )
     fig_streak.update_layout(plot_bgcolor="white", paper_bgcolor="white", height=300)
 
