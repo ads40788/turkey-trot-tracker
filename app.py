@@ -2,15 +2,24 @@
 Buffalo Turkey Trot Results Dashboard
 """
 
+import io
 import os
 import re
 import sqlite3
 from contextlib import closing
 from functools import lru_cache
+from html import escape as html_escape
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode
 
+import flask
 import numpy as np
 import pandas as pd
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+from werkzeug.middleware.proxy_fix import ProxyFix
 import plotly.express as px
 import plotly.graph_objects as go
 import dash
@@ -463,12 +472,27 @@ def streak_distribution() -> pd.DataFrame:
 # App setup
 # ---------------------------------------------------------------------------
 
-app = dash.Dash(
+class TrotDash(dash.Dash):
+    """Adds per-link title and Open Graph tags to the server-rendered page."""
+
+    def interpolate_index(self, **kwargs):
+        meta = share_meta_tags()
+        if meta:
+            title, tags = meta
+            kwargs["title"] = html_escape(title)
+            kwargs["metas"] = kwargs.get("metas", "") + "\n" + tags
+        return super().interpolate_index(**kwargs)
+
+
+app = TrotDash(
     __name__,
     external_stylesheets=[dbc.themes.FLATLY],
     title="Buffalo Turkey Trot",
 )
 server = app.server  # for deployment
+# Render terminates HTTPS at its proxy; trust X-Forwarded-Proto/Host so
+# absolute URLs in share links and preview tags come out as https://<site>.
+server.wsgi_app = ProxyFix(server.wsgi_app, x_proto=1, x_host=1)
 
 # Google Analytics (GA4). Set GA_MEASUREMENT_ID (e.g. G-XXXXXXXXXX) in the
 # hosting environment; when it's unset (local dev) no tracking code is emitted.
@@ -482,7 +506,12 @@ if re.fullmatch(r"G-[A-Z0-9]+", GA_MEASUREMENT_ID):
         "  window.dataLayer = window.dataLayer || [];\n"
         "  function gtag(){dataLayer.push(arguments);}\n"
         "  gtag('js', new Date());\n"
-        f"  gtag('config', '{GA_MEASUREMENT_ID}');\n"
+        # Shared links put runner names in the query string and page title;
+        # GA forbids personal info, so report only the bare path and site name.
+        f"  gtag('config', '{GA_MEASUREMENT_ID}', {{\n"
+        "    page_location: location.origin + location.pathname,\n"
+        "    page_title: 'Buffalo Turkey Trot'\n"
+        "  });\n"
         "</script>",
         1,
     )
@@ -560,6 +589,14 @@ lookup_tab = dbc.Container([
             ),
         ], md=6),
     ]),
+    # Share bar, hidden until a runner is selected
+    html.Div([
+        dbc.Button("🔗 Share link", id="share-btn", color="warning", size="sm",
+                   n_clicks=0, className="me-2"),
+        html.A(dbc.Button("⬇ Download image", color="secondary", outline=True, size="sm"),
+               id="download-link", href="", download="turkey-trot.png"),
+        html.Span(id="share-status", className="ms-2 small text-success"),
+    ], id="share-bar", className="mb-3", style={"display": "none"}),
     html.Div(id="runner-output"),
     # Link section — always in DOM, hidden until a runner is selected
     html.Div([
@@ -712,6 +749,7 @@ retention_tab = dbc.Container([
 
 
 app.layout = html.Div([
+    dcc.Location(id="url", refresh=False),
     HEADER,
     dbc.Container([
         dbc.Tabs([
@@ -834,7 +872,8 @@ def _name_options(search: str | None, selected: str | None) -> list[dict]:
 @app.callback(
     Output("runner-search", "options"),
     Input("runner-search", "search_value"),
-    State("runner-search", "value"),
+    # Input (not State) so a value set from a shared link gets its label.
+    Input("runner-search", "value"),
 )
 def update_search_options(search, selected):
     return _name_options(search, selected)
@@ -843,7 +882,7 @@ def update_search_options(search, selected):
 @app.callback(
     Output("runner-search-2", "options"),
     Input("runner-search-2", "search_value"),
-    State("runner-search-2", "value"),
+    Input("runner-search-2", "value"),
 )
 def update_search_options_2(search, selected):
     return _name_options(search, selected)
@@ -1143,6 +1182,262 @@ def do_remove_link(n_clicks_list, store):
     if not triggered:
         raise dash.exceptions.PreventUpdate
     return _remove_from_link_group(triggered["key"], store or [])
+
+
+# ---------------------------------------------------------------------------
+# Sharing: links (?runner=…&vs=…), preview image, and link-preview meta tags
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=4096)
+def _key_exists(key: str) -> bool:
+    return bool(query("SELECT 1 AS x FROM results WHERE name_key = ? LIMIT 1", (key,)).shape[0])
+
+
+def parse_share_args(args) -> tuple[str | None, str | None]:
+    """Read and validate runner keys from a query-string mapping."""
+    def _clean(v):
+        v = (v or "").strip().lower()[:100]
+        return v if v and _key_exists(v) else None
+    k1, k2 = _clean(args.get("runner")), _clean(args.get("vs"))
+    if not k1 and k2:
+        k1, k2 = k2, None
+    if k1 == k2:
+        k2 = None
+    return k1, k2
+
+
+def share_query(k1: str | None, k2: str | None) -> str:
+    params = {k: v for k, v in (("runner", k1), ("vs", k2)) if v}
+    return urlencode(params)
+
+
+def _share_person(key: str) -> tuple[str, pd.DataFrame]:
+    """Display label and results for the first person under a name key,
+    matching what the Runner Lookup tab shows first."""
+    df = runner_history(key)
+    primary = df["name"].value_counts().idxmax()
+    persons = split_into_persons(df)
+    person = persons[0]
+    label = person_label(primary, person) if len(persons) > 1 else primary
+    return label, person
+
+
+def h2h_record(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple[int, int, int]:
+    """(wins_1, wins_2, ties) across years both runners finished."""
+    d1 = df1[["year", "net_time_sec"]].dropna()
+    d2 = df2[["year", "net_time_sec"]].dropna()
+    m = d1.merge(d2, on="year", suffixes=("_1", "_2"))
+    diff = m["net_time_sec_1"] - m["net_time_sec_2"]
+    return int((diff < 0).sum()), int((diff > 0).sum()), int((diff == 0).sum())
+
+
+def share_summary(k1: str | None, k2: str | None) -> tuple[str, str]:
+    """(title, one-line description) for a shared link."""
+    if not k1:
+        return ("Buffalo Turkey Trot Results",
+                f"Look up any runner's results from {YEARS[0]} to {YEARS[-1]}.")
+    n1, p1 = _share_person(k1)
+    if not k2:
+        best = p1.loc[p1["net_time_sec"].idxmin()] if p1["net_time_sec"].notna().any() else None
+        races = len(p1)
+        desc = f"{races} Turkey Trot{'s' if races != 1 else ''}"
+        desc += f" ({int(p1['year'].min())}–{int(p1['year'].max())})" if races > 1 else f" ({int(p1['year'].iloc[0])})"
+        if best is not None:
+            desc += f" · best {fmt_time(best['net_time_sec'])} in {int(best['year'])}"
+        return f"{n1} · Buffalo Turkey Trot", desc
+    n2, p2 = _share_person(k2)
+    w1, w2, ties = h2h_record(p1, p2)
+    n = w1 + w2 + ties
+    s1, s2 = n1.split()[0], n2.split()[0]
+    if n == 0:
+        desc = "No shared races yet. Compare their Turkey Trot histories."
+    elif w1 == w2:
+        desc = f"Dead even at {w1}–{w2}" + (f"–{ties}" if ties else "") + f" across {n} shared races."
+    else:
+        lead, hi, lo = (s1, w1, w2) if w1 > w2 else (s2, w2, w1)
+        desc = f"{lead} leads {hi}–{lo}" + (f"–{ties}" if ties else "") + f" across {n} shared race{'s' if n != 1 else ''}."
+    return f"{n1} vs {n2} · Buffalo Turkey Trot", desc
+
+
+_CARD_COLORS = ["#e6500a", "#1a6eb5"]
+
+
+@lru_cache(maxsize=256)
+def build_preview_png(k1: str | None, k2: str | None, share_url: str) -> bytes:
+    """1200×630 PNG card (the standard link-preview size). Uses the
+    object-oriented Matplotlib API (no pyplot), which is safe across threads."""
+    fig = Figure(figsize=(12, 6.3), dpi=100, facecolor="#fffaf3")
+    FigureCanvasAgg(fig)
+
+    # Header band
+    fig.patches.append(Rectangle((0, 0.88), 1, 0.12, transform=fig.transFigure,
+                                 facecolor="#f39c12", zorder=0))
+    fig.text(0.04, 0.94, "BUFFALO TURKEY TROT RESULTS", fontsize=17, weight="bold",
+             color="#3b2a10", va="center")
+
+    title, desc = share_summary(k1, k2)
+    ax = fig.add_axes([0.09, 0.15, 0.87, 0.45])
+    ax.set_facecolor("#fffaf3")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+    if not k1:
+        df = year_summary()
+        fig.text(0.04, 0.78, "Every finisher since " + str(YEARS[0]), fontsize=34,
+                 weight="bold", color="#222", va="center")
+        fig.text(0.04, 0.68, desc, fontsize=18, color="#555", va="center")
+        ax.bar(df["year"], df["finishers"], color="#e6500a", width=0.8)
+        ax.set_ylabel("Finishers", fontsize=12, color="#555")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1000:g}k" if v else "0"))
+    else:
+        people = [_share_person(k1)] + ([_share_person(k2)] if k2 else [])
+        heading = "  vs  ".join(n for n, _ in people)
+        head = fig.text(0.04, 0.78, heading, fontsize=34, weight="bold",
+                        color="#222", va="center")
+        # Shrink long headings (e.g. two full names) to fit the card width.
+        renderer = fig.canvas.get_renderer()
+        width = head.get_window_extent(renderer).width
+        max_width = 0.92 * fig.bbox.width
+        if width > max_width:
+            head.set_fontsize(max(16, 34 * max_width / width))
+        fig.text(0.04, 0.68, desc, fontsize=18, color="#555", va="center")
+        for (name, p), color in zip(people, _CARD_COLORS):
+            p = p.dropna(subset=["net_time_sec"])
+            ax.plot(p["year"], p["net_time_sec"] / 60, marker="o", lw=2.5, ms=7,
+                    color=color, label=name)
+        ax.invert_yaxis()  # faster = higher
+        ax.set_ylabel("Net time", fontsize=12, color="#555")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt_time(v * 60)))
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
+        if k2:
+            ax.legend(frameon=False, fontsize=12, loc="best")
+
+    ax.tick_params(labelsize=11, colors="#555")
+    ax.grid(axis="y", color="#e8e0d4", lw=0.8)
+    ax.set_axisbelow(True)
+
+    display_url = re.sub(r"^https?://", "", share_url)
+    fig.text(0.04, 0.04, display_url, fontsize=12, color="#8a6d3b", va="center")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    return buf.getvalue()
+
+
+def _share_url_for(k1, k2) -> str:
+    root = flask.request.url_root  # honours X-Forwarded-* via ProxyFix
+    q = share_query(k1, k2)
+    return root + ("?" + q if q else "")
+
+
+@server.route("/preview.png")
+def preview_png():
+    k1, k2 = parse_share_args(flask.request.args)
+    png = build_preview_png(k1, k2, _share_url_for(k1, k2))
+    resp = flask.Response(png, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    if flask.request.args.get("download"):
+        fname = re.sub(r"[^a-z0-9]+", "-", "-vs-".join(k for k in (k1, k2) if k) or "turkey-trot")
+        resp.headers["Content-Disposition"] = f'attachment; filename="{fname}.png"'
+    return resp
+
+
+def share_meta_tags() -> tuple[str, str] | None:
+    """(title, extra <meta> HTML) for the page being requested, so link
+    previews (iMessage, Slack, Facebook, X…) show the right card. Crawlers
+    don't run JavaScript, so this must be in the server-rendered HTML."""
+    if not flask.has_request_context():
+        return None
+    k1, k2 = parse_share_args(flask.request.args)
+    title, desc = share_summary(k1, k2)
+    q = share_query(k1, k2)
+    root = flask.request.url_root
+    image = root + "preview.png" + ("?" + q if q else "")
+    page = root + ("?" + q if q else "")
+    e = lambda s: html_escape(s, quote=True)
+    tags = [
+        f'<meta name="description" content="{e(desc)}">',
+        '<meta property="og:type" content="website">',
+        f'<meta property="og:title" content="{e(title)}">',
+        f'<meta property="og:description" content="{e(desc)}">',
+        f'<meta property="og:url" content="{e(page)}">',
+        f'<meta property="og:image" content="{e(image)}">',
+        '<meta property="og:image:width" content="1200">',
+        '<meta property="og:image:height" content="630">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{e(title)}">',
+        f'<meta name="twitter:description" content="{e(desc)}">',
+        f'<meta name="twitter:image" content="{e(image)}">',
+    ]
+    return title, "\n".join(tags)
+
+
+@app.callback(
+    Output("runner-search", "value"),
+    Output("runner-search-2", "value"),
+    # Dash 4 dropdowns drop a value that isn't in their options, so the
+    # options have to arrive in the same update as the value.
+    Output("runner-search", "options", allow_duplicate=True),
+    Output("runner-search-2", "options", allow_duplicate=True),
+    Output("main-tabs", "active_tab"),
+    Input("url", "search"),
+    prevent_initial_call="initial_duplicate",
+)
+def load_shared_link(search):
+    """Opening a shared link pre-fills the runners and shows Runner Lookup."""
+    k1, k2 = parse_share_args({k: v[0] for k, v in parse_qs((search or "").lstrip("?")).items()})
+    if not k1:
+        raise dash.exceptions.PreventUpdate
+    return (k1, k2, _name_options(None, k1),
+            _name_options(None, k2) if k2 else dash.no_update, "tab-lookup")
+
+
+@app.callback(
+    Output("share-bar", "style"),
+    Output("download-link", "href"),
+    Output("download-link", "download"),
+    Input("runner-search", "value"),
+    Input("runner-search-2", "value"),
+)
+def update_share_bar(k1, k2):
+    if not (k1 or k2):
+        return {"display": "none"}, "", "turkey-trot.png"
+    k1, k2 = (k1, k2) if k1 else (k2, None)
+    q = share_query(k1, k2)
+    fname = re.sub(r"[^a-z0-9]+", "-", "-vs-".join(k for k in (k1, k2) if k)) + ".png"
+    return {}, f"/preview.png?{q}&download=1", fname
+
+
+app.clientside_callback(
+    """
+    async function(n, k1, k2) {
+        if (!n || !(k1 || k2)) { return window.dash_clientside.no_update; }
+        if (!k1) { k1 = k2; k2 = null; }
+        const p = new URLSearchParams();
+        p.set("runner", k1);
+        if (k2 && k2 !== k1) { p.set("vs", k2); }
+        const url = location.origin + location.pathname + "?" + p.toString();
+        const isMobile = /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
+        if (isMobile && navigator.share) {
+            try { await navigator.share({title: "Buffalo Turkey Trot results", url: url}); }
+            catch (e) { /* user cancelled */ }
+            return "";
+        }
+        try {
+            await navigator.clipboard.writeText(url);
+            return "✓ Link copied";
+        } catch (e) {
+            window.prompt("Copy this link:", url);
+            return "";
+        }
+    }
+    """,
+    Output("share-status", "children"),
+    Input("share-btn", "n_clicks"),
+    State("runner-search", "value"),
+    State("runner-search-2", "value"),
+    prevent_initial_call=True,
+)
 
 
 # ---------------------------------------------------------------------------
