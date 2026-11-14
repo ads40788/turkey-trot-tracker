@@ -2,6 +2,7 @@
 Buffalo Turkey Trot Results Dashboard
 """
 
+import os
 import re
 import sqlite3
 from contextlib import closing
@@ -468,6 +469,23 @@ app = dash.Dash(
     title="Buffalo Turkey Trot",
 )
 server = app.server  # for deployment
+
+# Google Analytics (GA4). Set GA_MEASUREMENT_ID (e.g. G-XXXXXXXXXX) in the
+# hosting environment; when it's unset (local dev) no tracking code is emitted.
+GA_MEASUREMENT_ID = os.environ.get("GA_MEASUREMENT_ID", "").strip()
+if re.fullmatch(r"G-[A-Z0-9]+", GA_MEASUREMENT_ID):
+    app.index_string = app.index_string.replace(
+        "{%metas%}",
+        "{%metas%}\n"
+        f'<script async src="https://www.googletagmanager.com/gtag/js?id={GA_MEASUREMENT_ID}"></script>\n'
+        "<script>\n"
+        "  window.dataLayer = window.dataLayer || [];\n"
+        "  function gtag(){dataLayer.push(arguments);}\n"
+        "  gtag('js', new Date());\n"
+        f"  gtag('config', '{GA_MEASUREMENT_ID}');\n"
+        "</script>",
+        1,
+    )
 
 def _backfill_name_keys() -> None:
     """Rows added after the name_key migration (e.g. 2020) have NULL keys and

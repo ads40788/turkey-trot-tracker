@@ -8,3 +8,5 @@ services:
     envVars:
       - key: DATA_REPO_TOKEN
         sync: false
+      - key: GA_MEASUREMENT_ID
+        sync: false
