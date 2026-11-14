@@ -6,6 +6,7 @@ import io
 import os
 import re
 import sqlite3
+import textwrap
 from contextlib import closing
 from functools import lru_cache
 from html import escape as html_escape
@@ -593,8 +594,20 @@ lookup_tab = dbc.Container([
     html.Div([
         dbc.Button("🔗 Share link", id="share-btn", color="warning", size="sm",
                    n_clicks=0, className="me-2"),
-        html.A(dbc.Button("⬇ Download image", color="secondary", outline=True, size="sm"),
-               id="download-link", href="", download="turkey-trot.png"),
+        dbc.DropdownMenu(
+            label="⬇ Download image",
+            color="secondary", size="sm", className="d-inline-block",
+            toggle_class_name="btn-outline-secondary",
+            children=[
+                # The server sends these as attachments, so a plain link downloads.
+                dbc.DropdownMenuItem("Link preview / Facebook (1200×630)",
+                                     id="download-landscape", href="", external_link=True),
+                dbc.DropdownMenuItem("Instagram post (1080×1350)",
+                                     id="download-portrait", href="", external_link=True),
+                dbc.DropdownMenuItem("Instagram story (1080×1920)",
+                                     id="download-story", href="", external_link=True),
+            ],
+        ),
         html.Span(id="share-status", className="ms-2 small text-success"),
     ], id="share-bar", className="mb-3", style={"display": "none"}),
     html.Div(id="runner-output"),
@@ -1261,63 +1274,122 @@ def share_summary(k1: str | None, k2: str | None) -> tuple[str, str]:
 
 _CARD_COLORS = ["#e6500a", "#1a6eb5"]
 
+# Card layouts. Positions are fractions of the figure (0 = bottom, 1 = top);
+# font sizes are in points at 100 dpi, so 1 pt ≈ 1.4 px.
+CARD_SIZES = {
+    # Link previews (Facebook, iMessage, Slack, X): 1200×630
+    "landscape": dict(fig=(12, 6.3), band=0.12, header_fs=17, stack=False,
+                      head_y=0.78, head_fs=34, desc_y=0.68, desc_fs=18, wrap=90,
+                      ax=[0.09, 0.15, 0.87, 0.45], tick_fs=11, label_fs=12,
+                      url_y=0.04, url_fs=12, url_band=False),
+    # Instagram feed post (4:5): 1080×1350
+    "portrait": dict(fig=(10.8, 13.5), band=0.07, header_fs=22, stack=True,
+                     head_y=0.88, head_fs=50, desc_y=0.70, desc_fs=24, wrap=42,
+                     ax=[0.15, 0.17, 0.78, 0.43], tick_fs=16, label_fs=17,
+                     url_y=0.05, url_fs=22, url_band=True, url_to_bottom=True),
+    # Instagram story (9:16): 1080×1920. Instagram's own UI covers roughly the
+    # top 13% and bottom 18%, so the important content stays between those.
+    "story": dict(fig=(10.8, 19.2), band=0.16, header_y=0.875, header_fs=26, stack=True,
+                  head_y=0.80, head_fs=56, desc_y=0.64, desc_fs=28, wrap=38,
+                  ax=[0.16, 0.30, 0.77, 0.27], tick_fs=18, label_fs=19,
+                  url_y=0.225, url_fs=24, url_band=True, url_to_bottom=True),
+}
 
-@lru_cache(maxsize=256)
-def build_preview_png(k1: str | None, k2: str | None, share_url: str) -> bytes:
-    """1200×630 PNG card (the standard link-preview size). Uses the
-    object-oriented Matplotlib API (no pyplot), which is safe across threads."""
-    fig = Figure(figsize=(12, 6.3), dpi=100, facecolor="#fffaf3")
+
+def _fit_text(fig, text_artist, max_frac: float = 0.92, min_fs: float = 14) -> None:
+    """Shrink a text artist's font until it fits within max_frac of the width."""
+    renderer = fig.canvas.get_renderer()
+    width = text_artist.get_window_extent(renderer).width
+    max_width = max_frac * fig.bbox.width
+    if width > max_width:
+        text_artist.set_fontsize(max(min_fs, text_artist.get_fontsize() * max_width / width))
+
+
+@lru_cache(maxsize=512)
+def build_preview_png(k1: str | None, k2: str | None, share_url: str,
+                      size: str = "landscape") -> bytes:
+    """Shareable PNG card in one of CARD_SIZES. Uses the object-oriented
+    Matplotlib API (no pyplot), which is safe across threads."""
+    L = CARD_SIZES.get(size, CARD_SIZES["landscape"])
+    fig = Figure(figsize=L["fig"], dpi=100, facecolor="#fffaf3")
     FigureCanvasAgg(fig)
+    x0 = 0.06 if L["stack"] else 0.04
 
     # Header band
-    fig.patches.append(Rectangle((0, 0.88), 1, 0.12, transform=fig.transFigure,
+    fig.patches.append(Rectangle((0, 1 - L["band"]), 1, L["band"], transform=fig.transFigure,
                                  facecolor="#f39c12", zorder=0))
-    fig.text(0.04, 0.94, "BUFFALO TURKEY TROT RESULTS", fontsize=17, weight="bold",
-             color="#3b2a10", va="center")
+    fig.text(x0, L.get("header_y", 1 - L["band"] / 2), "BUFFALO TURKEY TROT RESULTS",
+             fontsize=L["header_fs"],
+             weight="bold", color="#3b2a10", va="center")
 
     title, desc = share_summary(k1, k2)
-    ax = fig.add_axes([0.09, 0.15, 0.87, 0.45])
+    ax = fig.add_axes(L["ax"])
     ax.set_facecolor("#fffaf3")
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
 
     if not k1:
         df = year_summary()
-        fig.text(0.04, 0.78, "Every finisher since " + str(YEARS[0]), fontsize=34,
-                 weight="bold", color="#222", va="center")
-        fig.text(0.04, 0.68, desc, fontsize=18, color="#555", va="center")
+        heading = (f"Every finisher\nsince {YEARS[0]}" if L["stack"]
+                   else f"Every finisher since {YEARS[0]}")
         ax.bar(df["year"], df["finishers"], color="#e6500a", width=0.8)
-        ax.set_ylabel("Finishers", fontsize=12, color="#555")
+        ax.set_ylabel("Finishers", fontsize=L["label_fs"], color="#555")
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / 1000:g}k" if v else "0"))
     else:
         people = [_share_person(k1)] + ([_share_person(k2)] if k2 else [])
-        heading = "  vs  ".join(n for n, _ in people)
-        head = fig.text(0.04, 0.78, heading, fontsize=34, weight="bold",
-                        color="#222", va="center")
-        # Shrink long headings (e.g. two full names) to fit the card width.
-        renderer = fig.canvas.get_renderer()
-        width = head.get_window_extent(renderer).width
-        max_width = 0.92 * fig.bbox.width
-        if width > max_width:
-            head.set_fontsize(max(16, 34 * max_width / width))
-        fig.text(0.04, 0.68, desc, fontsize=18, color="#555", va="center")
+        # Tall cards stack the names; wide cards keep them on one line.
+        heading = ("\nvs\n" if L["stack"] else "  vs  ").join(n for n, _ in people)
         for (name, p), color in zip(people, _CARD_COLORS):
             p = p.dropna(subset=["net_time_sec"])
-            ax.plot(p["year"], p["net_time_sec"] / 60, marker="o", lw=2.5, ms=7,
+            ax.plot(p["year"], p["net_time_sec"] / 60, marker="o",
+                    lw=2.5 if not L["stack"] else 3.5, ms=7 if not L["stack"] else 10,
                     color=color, label=name)
         ax.invert_yaxis()  # faster = higher
-        ax.set_ylabel("Net time", fontsize=12, color="#555")
+        ax.set_ylabel("Net time", fontsize=L["label_fs"], color="#555")
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt_time(v * 60)))
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10 if not L["stack"] else 6))
         if k2:
-            ax.legend(frameon=False, fontsize=12, loc="best")
+            ax.legend(frameon=False, fontsize=L["label_fs"], loc="best")
 
-    ax.tick_params(labelsize=11, colors="#555")
+    head = fig.text(x0, L["head_y"], heading, fontsize=L["head_fs"], weight="bold",
+                    color="#222", va="center" if not L["stack"] else "top",
+                    linespacing=1.15)
+    _fit_text(fig, head, max_frac=0.88 if L["stack"] else 0.92)
+    desc_text = textwrap.fill(desc, L["wrap"])
+    if L["stack"]:
+        # Headings are 1–3 lines tall; keep the summary just below the heading.
+        renderer = fig.canvas.get_renderer()
+        head_bottom = head.get_window_extent(renderer).y0 / fig.bbox.height
+        desc_artist = fig.text(x0, head_bottom - 0.035, desc_text, fontsize=L["desc_fs"],
+                               color="#555", va="top", linespacing=1.3)
+        # Let the chart grow up into whatever space the text leaves free.
+        desc_bottom = desc_artist.get_window_extent(renderer).y0 / fig.bbox.height
+        ax_x, ax_y, ax_w, _ = L["ax"]
+        ax.set_position([ax_x, ax_y, ax_w, desc_bottom - 0.06 - ax_y])
+    else:
+        fig.text(x0, L["desc_y"], desc_text, fontsize=L["desc_fs"],
+                 color="#555", va="center", linespacing=1.3)
+
+    ax.tick_params(labelsize=L["tick_fs"], colors="#555")
     ax.grid(axis="y", color="#e8e0d4", lw=0.8)
     ax.set_axisbelow(True)
 
-    display_url = re.sub(r"^https?://", "", share_url)
-    fig.text(0.04, 0.04, display_url, fontsize=12, color="#8a6d3b", va="center")
+    # Site address. On Instagram it can't be tapped, so tall cards make it a
+    # prominent call to action.
+    display_url = re.sub(r"^https?://", "", share_url).rstrip("/")
+    if L["url_band"]:
+        band_h = L["url_fs"] * 4.2 / (L["fig"][1] * 100)
+        band_top = L["url_y"] + band_h / 2
+        band_bottom = 0 if L.get("url_to_bottom") else L["url_y"] - band_h / 2
+        fig.patches.append(Rectangle((0, band_bottom), 1, band_top - band_bottom,
+                                     transform=fig.transFigure, facecolor="#3b2a10", zorder=0))
+        fig.text(0.5, L["url_y"] + band_h * 0.17, "Look up your results",
+                 fontsize=L["url_fs"] * 0.75, color="#f8d9a0", ha="center", va="center")
+        url = fig.text(0.5, L["url_y"] - band_h * 0.17, display_url, fontsize=L["url_fs"],
+                       weight="bold", color="white", ha="center", va="center")
+        _fit_text(fig, url, max_frac=0.9)
+    else:
+        fig.text(x0, L["url_y"], display_url, fontsize=L["url_fs"], color="#8a6d3b", va="center")
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
@@ -1333,12 +1405,16 @@ def _share_url_for(k1, k2) -> str:
 @server.route("/preview.png")
 def preview_png():
     k1, k2 = parse_share_args(flask.request.args)
-    png = build_preview_png(k1, k2, _share_url_for(k1, k2))
+    size = flask.request.args.get("size", "landscape")
+    if size not in CARD_SIZES:
+        size = "landscape"
+    png = build_preview_png(k1, k2, _share_url_for(k1, k2), size)
     resp = flask.Response(png, mimetype="image/png")
     resp.headers["Cache-Control"] = "public, max-age=86400"
     if flask.request.args.get("download"):
         fname = re.sub(r"[^a-z0-9]+", "-", "-vs-".join(k for k in (k1, k2) if k) or "turkey-trot")
-        resp.headers["Content-Disposition"] = f'attachment; filename="{fname}.png"'
+        suffix = "" if size == "landscape" else f"-{size}"
+        resp.headers["Content-Disposition"] = f'attachment; filename="{fname}{suffix}.png"'
     return resp
 
 
@@ -1394,18 +1470,19 @@ def load_shared_link(search):
 
 @app.callback(
     Output("share-bar", "style"),
-    Output("download-link", "href"),
-    Output("download-link", "download"),
+    Output("download-landscape", "href"),
+    Output("download-portrait", "href"),
+    Output("download-story", "href"),
     Input("runner-search", "value"),
     Input("runner-search-2", "value"),
 )
 def update_share_bar(k1, k2):
     if not (k1 or k2):
-        return {"display": "none"}, "", "turkey-trot.png"
+        return {"display": "none"}, "", "", ""
     k1, k2 = (k1, k2) if k1 else (k2, None)
     q = share_query(k1, k2)
-    fname = re.sub(r"[^a-z0-9]+", "-", "-vs-".join(k for k in (k1, k2) if k)) + ".png"
-    return {}, f"/preview.png?{q}&download=1", fname
+    return ({}, *(f"/preview.png?{q}&size={s}&download=1"
+                  for s in ("landscape", "portrait", "story")))
 
 
 app.clientside_callback(
