@@ -1387,6 +1387,26 @@ def update_corral(year, tab="tab-corral"):
     fig_scatter.update_layout(plot_bgcolor="white", paper_bgcolor="white", height=400)
     fig_scatter.update_traces(marker=dict(size=4))
 
+    # Zone of shame: the slowest quarter by net time (>= P75) who started with
+    # the front quarter of the field (wave delay <= P25). Computed on the full
+    # field, not the plotted sample.
+    net_p75 = df["net_min"].quantile(0.75)
+    gap_p25 = df["wave_gap_min"].quantile(0.25)
+    in_zone = (df["net_min"] >= net_p75) & (df["wave_gap_min"] <= gap_p25)
+    n_zone = int(in_zone.sum())
+    pct_zone = 100 * n_zone / len(df)
+    fig_scatter.add_shape(
+        type="rect", layer="above", line_width=1, line_dash="dot",
+        line_color="rgba(200, 30, 30, 0.7)", fillcolor="rgba(230, 60, 60, 0.15)",
+        x0=net_p75, x1=df["net_min"].max(),
+        y0=min(0.0, df["wave_gap_min"].min()), y1=gap_p25,
+    )
+    fig_scatter.add_annotation(
+        x=df["net_min"].max(), y=gap_p25, xanchor="right", yanchor="bottom",
+        text=f"<b>Zone of shame</b> ({n_zone:,} runners)", showarrow=False,
+        font=dict(color="#b22222", size=12),
+    )
+
     # Stats
     n_front_jump = (df["wave_gap_sec"] < 60).sum()
     pct_fj = 100 * n_front_jump / len(df)
@@ -1397,6 +1417,16 @@ def update_corral(year, tab="tab-corral"):
         html.P(f"Median wave gap: {df['wave_gap_sec'].median():.0f}s"),
         html.P(f"<60s gap (near-front): {n_front_jump:,} ({pct_fj:.1f}%)"),
         html.P(f"Correlation (gap vs net time): {corr:.3f}"),
+        html.P([
+            html.Span("Zone of shame: ", className="fw-semibold", style={"color": "#b22222"}),
+            f"{n_zone:,} ({pct_zone:.1f}%)",
+            html.Br(),
+            html.Small(
+                f"Slowest 25% (net ≥ {fmt_time(net_p75 * 60)}) who started in the "
+                f"front 25% (wave delay ≤ {fmt_time(gap_p25 * 60)})",
+                className="text-muted",
+            ),
+        ]),
         dbc.Alert(
             "A strong positive correlation means slower runners are correctly "
             "seeding further back. Near-zero or negative suggests front-jumping.",
